@@ -1,0 +1,8 @@
+[package]
+name = "parallel_waves"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy-shader-plugin = "0.2.2"
+bevy = { version = "0.19", default-features = false, features = ["default_app", "default_platform", "debug"] }
