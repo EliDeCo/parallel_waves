@@ -8,14 +8,17 @@ use std::time::Duration;
 const SHADER_PATH: &str = "shaders/shader.wgsl";
 const CELL_COUNT: u32 = 2048;
 const COURANT: f32 = 0.5;
+const REDOX_WG_SIZE: u32 = 256;
 
-//name tag
+//name tags
 struct States;
+struct Partials;
 
 #[derive(Resource, ShaderType, Clone, Default)]
 struct Params {
     cell_count: u32,
     courant: f32,
+    dx: f32,
 }
 
 fn main() {
@@ -34,11 +37,11 @@ fn main() {
             ScheduleRunnerPlugin::run_loop(Duration::ZERO),
         ))
         //set up compute shaders
-        .add_plugins(
-            ComputeShaderPlugin::new(SHADER_PATH)
-                .init_pass("init", Workgroups::over::<States>())
-                .pass("update", Workgroups::over::<States>()),
-                //may add substeps in the future if still cpu limited
+        .add_plugins(ComputeShaderPlugin::new(SHADER_PATH)
+            .init_pass("init", Workgroups::over::<States>())
+            .pass("update", Workgroups::over::<States>())
+            .pass("redox_pass_1", Workgroups::exact(uvec3(REDOX_WG_SIZE,1,1)))
+            .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
         )
         //buffers
         .register_gpu_buffer::<States, Vec4>(0, 0, CELL_COUNT)
@@ -47,7 +50,10 @@ fn main() {
         .insert_resource(Params {
             cell_count: CELL_COUNT,
             courant: COURANT,
+            dx: 1.0/ CELL_COUNT as f32
         })
+        .register_gpu_buffer::<Partials, f32>(0, 2, REDOX_WG_SIZE)
+        //.read_back_gpu_buffer::<Partials, f32>(ReadbackMode::EveryFrame)
         //systems
         .add_systems(
             Update,
@@ -63,14 +69,26 @@ fn ask_readback(readback: Res<GpuReadback<States, Vec4>>) {
     readback.request();
 }
 
-fn display_data(readback: Res<GpuReadback<States, Vec4>>) {
-    if !readback.is_changed() {
+fn display_data(
+    states: Res<GpuReadback<States, Vec4>>,
+    //dt: Res<GpuReadback<Partials, f32>>
+) {
+    /* 
+    //dt data
+    if let Some(timestep) = dt.latest() {
+        println!("dt: {}", timestep[0]);
+    }
+    */
+
+
+    //state data
+    if !states.is_changed() {
         return;
     }
 
-    let Some(data) = readback.latest() else {
+    let Some(data) = states.latest() else {
         return;
     };
 
-    println!("{}", data.len());
+    println!("{:?}", data[1024]);
 }
