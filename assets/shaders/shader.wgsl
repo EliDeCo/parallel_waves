@@ -1,8 +1,7 @@
-//TODO: ADD DECODED BUFFER TO AVOID DOUBLE DUPLICATION
-//TODO: RECURSIVE MINIMIZING
 const GAMMA: f32 = 1.4;
 const WG_SIZE: u32 = 64;
-const REDOX_WG_SIZE: u32 = 256; //specifically for timestep reduction
+//specifically for timestep reduction
+const REDOX_WG_SIZE: u32 = 256; 
 const NUM_REDOX_WG: u32 = 256;
 const TOTAL_THREADS: u32 = REDOX_WG_SIZE * NUM_REDOX_WG;
 const F32_MAX: f32 = 3.4028235e+38; 
@@ -11,6 +10,7 @@ struct Params {
     cell_count: u32,
     courant: f32,
     dx: f32,
+    t_max: f32
 }
 
 struct Decoded {
@@ -24,8 +24,10 @@ struct Decoded {
 }
 
 @group(0) @binding(0) var<storage, read_write> states: array<vec4f>;
-@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> decoded: array<Decoded>;
 @group(0) @binding(2) var<storage, read_write> partials: array<f32>;
+@group(1) @binding(0) var<uniform> params: Params;
+@group(1) @binding(1) var<storage, read_write> time_buffer: array<f32>;
 
 //Compiler wont allow using REDOX_WG_SIZE here, make sure this matches ALWAYS
 var<workgroup> scratch: array<f32, 256>;
@@ -43,6 +45,10 @@ fn init(@builtin(global_invocation_id) id: vec3u) {
         vec4f(1.0,   0.0, 1.0 / (GAMMA - 1.0), 0.0),  // (ρ, ρu, E) left
         index < (params.cell_count >> 1),
     );
+
+    //ensure total time elapsed and total cycles are properly initialized
+    time_buffer[0] = 0;
+    time_buffer[1] = 0;
 }
 
 @compute @workgroup_size(WG_SIZE)
@@ -50,19 +56,22 @@ fn update(
     @builtin(global_invocation_id) gid: vec3<u32>,
 ) {
     let index = gid.x;
-    if index >= params.cell_count { return; }
+    if index >= params.cell_count || time_buffer[0] >= params.t_max { return; }
 
+    //flux stuff happens here
     let dt = partials[0];
 
-    //do nothing for now
-    states[index].w = dt;
+
+    //temporarily use this to send back data for debugging
+    
+    states[index].w = dt; //sending total runtime
 }
 
 ///Returns the HLLC flux between two decoded states, using the wave speeds of
 ///Batten, Clarke, Lambert & Causon (1997).
 fn hllc(index: u32, gamma: f32) -> vec3f {
-    let d_l = decode_all(states[index].xyz, gamma);
-    let d_r = decode_all(states[index+1].xyz, gamma);
+    let d_l = decoded[index];
+    let d_r = decoded[index+1];
 
     //(1) Roe averages of velocity, total enthalpy and sound speed
     let k = sqrt(d_r.rho / d_l.rho);
@@ -142,8 +151,8 @@ fn decode_all(q: vec3f, gamma: f32) -> Decoded {
 }
 
 //gets the local timestep for this cell
-fn get_timestep(decoded: Decoded, dx: f32) -> f32 {
-    return params.courant * dx / (abs(decoded.u) + decoded.a);
+fn get_timestep(index: u32) -> f32 {
+    return params.courant * params.dx / (abs(decoded[index].u) + decoded[index].a);
 }
 
 //reduce all cells to just 256 partials
@@ -153,13 +162,13 @@ fn redox_pass_1(
     @builtin(local_invocation_id)  lid: vec3<u32>,
     @builtin(workgroup_id)         wid: vec3<u32>,
 ) {
+    if time_buffer[0] >= params.t_max { return; }
     let n = params.cell_count;
 
     //grid stride loop
     var local_min = F32_MAX;
     for (var i = gid.x; i < n; i += TOTAL_THREADS) {
-        //TODO: MOVE DECODING TO SEPERATE PASS
-        let v = get_timestep(decode_all(states[i].xyz, GAMMA), params.dx);
+        let v = get_timestep(i);
         local_min = min(v, local_min);
     }
 
@@ -184,6 +193,7 @@ fn redox_pass_1(
 //reduces all 256 partials with a single workgroup to get the final minimum
 @compute @workgroup_size(REDOX_WG_SIZE)
 fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
+    if time_buffer[0] >= params.t_max { return; }
     scratch[lid.x] = partials[lid.x];
     workgroupBarrier();
 
@@ -197,8 +207,31 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
         stride >>= 1;
     }
 
-    //final answer resides in partials[0]
+    
+
+
+    //thread 0 gives final answers
     if lid.x == 0 {
-        partials[0] = scratch[0];
+        var dt = scratch[0];
+        var t = time_buffer[0];
+        if (t + dt) > params.t_max {
+            dt = params.t_max - t;
+        }
+        t += dt;
+
+        time_buffer[0] = t; //update total elapsed time
+        partials[0] = dt; //update dt
+        time_buffer[1] += 1; //update cycle counter
     }
+}
+
+//Decodes the entire pipe and stores it in memory
+@compute @workgroup_size(WG_SIZE)
+fn decode_pipe(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+) {
+    let index = gid.x;
+    if index >= params.cell_count || time_buffer[0] >= params.t_max { return; }
+
+    decoded[index] = decode_all(states[index].xyz, GAMMA);
 }
