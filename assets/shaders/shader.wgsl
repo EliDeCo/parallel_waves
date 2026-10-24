@@ -23,48 +23,95 @@ struct Decoded {
     euler: vec3f, //physical euler flux
 }
 
-@group(0) @binding(0) var<storage, read_write> states: array<vec4f>;
-@group(0) @binding(1) var<storage, read_write> decoded: array<Decoded>;
-@group(0) @binding(2) var<storage, read_write> partials: array<f32>;
+//if step count % 2 == 0, read from states1 and write to states2; otherwise do the opposite
+//first 3 are state values, last f32 is pipe radius
+@group(0) @binding(0) var<storage, read_write> states1: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> states2: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> decoded: array<Decoded>;
+@group(0) @binding(3) var<storage, read_write> partials: array<f32>;
 @group(1) @binding(0) var<uniform> params: Params;
 @group(1) @binding(1) var<storage, read_write> time_buffer: array<f32>;
 
 //Compiler wont allow using REDOX_WG_SIZE here, make sure this matches ALWAYS
 var<workgroup> scratch: array<f32, 256>;
+//compiler won't allow using WG_SIZE + 1 here
+var<workgroup> fluxes: array<vec3f, 65>;
 
 @compute @workgroup_size(WG_SIZE)
 fn init(@builtin(global_invocation_id) id: vec3u) {
     let index = id.x;
-    if index >= params.cell_count {return;}
+    if index >= params.cell_count + 2 {return;} //include ghosts in init
 
     //default to Sod's problem:
     //Left state: rho = 1, u = 0, p = 1
     //Right state: rho = 0.125, u = 0, p = 0.1
-    states[index] = select(
+    let s = select(
         vec4f(0.125, 0.0, 0.1 / (GAMMA - 1.0), 0.0),  // (ρ, ρu, E) right
         vec4f(1.0,   0.0, 1.0 / (GAMMA - 1.0), 0.0),  // (ρ, ρu, E) left
-        index < (params.cell_count >> 1),
+        index <= (params.cell_count >> 1),
     );
 
+    states1[index] = s;
+    states2[index] = s;
+
     //ensure total time elapsed and total cycles are properly initialized
-    time_buffer[0] = 0;
-    time_buffer[1] = 0;
+    if index == 0 {
+        time_buffer[0] = 0;
+        time_buffer[1] = 0;
+        time_buffer[2] = 0;
+    }
+
 }
 
 @compute @workgroup_size(WG_SIZE)
 fn update(
     @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,  
 ) {
-    let index = gid.x;
-    if index >= params.cell_count || time_buffer[0] >= params.t_max { return; }
-
-    //flux stuff happens here
+    let i = gid.x + 1; // interior cell index (1 ghost cell at each end)
+    
+    
     let dt = partials[0];
 
-
-    //temporarily use this to send back data for debugging
+    //flux stuff happens here
     
-    states[index].w = dt; //sending total runtime
+    let n = params.cell_count;
+
+    // Each thread computes the face on its left; the last thread also does the right edge.
+    fluxes[lid.x] = hllc(min(i-1,n), GAMMA); // F_{i-1/2}
+    if lid.x == WG_SIZE - 1 {
+        fluxes[WG_SIZE] = hllc(min(i,n), GAMMA); // F_{i+1/2}
+    }
+    workgroupBarrier();
+    if i > params.cell_count || partials[0] == 0.0 { return; }
+    
+    let old_state = select(states2[i],states1[i],time_buffer[1] % 2 == 1).xyz;
+    let new_state = old_state - (dt / params.dx) * (fluxes[lid.x + 1u] - fluxes[lid.x]);
+    //write to the correct buffer (this will never branch)
+    if time_buffer[1] % 2 == 1 {
+        states2[i].x = new_state.x;
+        states2[i].y = new_state.y;
+        states2[i].z = new_state.z;
+    } else {
+        states1[i].x = new_state.x;
+        states1[i].y = new_state.y;
+        states1[i].z = new_state.z;
+    }
+}
+
+@compute @workgroup_size(2)
+fn apply_boundaries(
+    @builtin(global_invocation_id) gid: vec3<u32>, 
+) {
+    let n = params.cell_count;
+    let ghost = select(n + 1, 0u, gid.x == 0);
+    let edge = select(n, 1u, gid.x == 0);
+
+    if time_buffer[1] % 2 == 1 {
+        states2[ghost] = states2[edge];
+    } else {
+        states1[ghost] = states1[edge];
+    }
 }
 
 ///Returns the HLLC flux between two decoded states, using the wave speeds of
@@ -167,7 +214,7 @@ fn redox_pass_1(
 
     //grid stride loop
     var local_min = F32_MAX;
-    for (var i = gid.x; i < n; i += TOTAL_THREADS) {
+    for (var i = gid.x + 1; i <= n; i += TOTAL_THREADS) {
         let v = get_timestep(i);
         local_min = min(v, local_min);
     }
@@ -193,7 +240,10 @@ fn redox_pass_1(
 //reduces all 256 partials with a single workgroup to get the final minimum
 @compute @workgroup_size(REDOX_WG_SIZE)
 fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
-    if time_buffer[0] >= params.t_max { return; }
+    if time_buffer[0] >= params.t_max { 
+        if lid.x == 0 { partials[0] = 0; } //set dt to 0 when finished
+        return; 
+    }
     scratch[lid.x] = partials[lid.x];
     workgroupBarrier();
 
@@ -214,15 +264,34 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
     if lid.x == 0 {
         var dt = scratch[0];
         var t = time_buffer[0];
+
+        if dt != dt {
+            raise_error(2);
+            return;
+        } else if dt >= F32_MAX {
+            raise_error(1);
+            return;
+        } 
+
         if (t + dt) > params.t_max {
             dt = params.t_max - t;
         }
         t += dt;
 
+
         time_buffer[0] = t; //update total elapsed time
-        partials[0] = dt; //update dt
         time_buffer[1] += 1; //update cycle counter
+        partials[0] = dt; //update dt
     }
+}
+//1 -> dt == F32_MAX
+//2 -> dt = NaN
+//3 -> nonphysical density
+//4 -> nonphysical pressure
+fn raise_error(error_id: f32) {
+    time_buffer[0] = params.t_max;  //stop all passes
+    time_buffer[2] = error_id;           //error flag for the CPU
+    partials[0] = 0.0;    
 }
 
 //Decodes the entire pipe and stores it in memory
@@ -231,7 +300,16 @@ fn decode_pipe(
     @builtin(global_invocation_id) gid: vec3<u32>,
 ) {
     let index = gid.x;
-    if index >= params.cell_count || time_buffer[0] >= params.t_max { return; }
+    if index >= params.cell_count + 2 || time_buffer[0] >= params.t_max { return; }
 
-    decoded[index] = decode_all(states[index].xyz, GAMMA);
+    let d = decode_all(select(states2[index],states1[index],time_buffer[1] % 2 == 0).xyz, GAMMA);
+
+
+    if !(d.rho > 0.0) {
+        raise_error(3);
+    } else if !(d.p > 0.0) {
+        raise_error(4);
+    }
+
+    decoded[index] = d;
 }
