@@ -3,7 +3,7 @@ use bevy::{
     window::ExitCondition, winit::WinitPlugin,
 };
 use bevy_shader_plugin::prelude::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SHADER_PATH: &str = "shaders/shader.wgsl";
 const CELL_COUNT: u32 = 2048;
@@ -12,6 +12,8 @@ const COURANT: f32 = 0.5;
 //const REDOX_WG_SIZE: u32 = 256;
 const NUM_REDOX_WG: u32 = 256;
 const T_MAX: f32 = 0.2;
+const SUBSTEPS: u32 = 1;
+
 //name tags
 struct States1;
 struct States2;
@@ -24,7 +26,7 @@ struct Params {
     cell_count: u32,
     courant: f32,
     dx: f32,
-    t_max: f32
+    t_max: f32,
 }
 
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -41,10 +43,34 @@ struct Decoded {
 #[derive(Resource)]
 struct TimeData {
     done: bool,
-    state_num: usize
+    state_num: usize,
+    timer: Instant,
 }
 
+
+#[derive(ShaderType, Clone, Copy, Default)]
+struct CellData {
+    q1: f32,
+    q2: f32,
+    q3: f32,
+    radius: f32,
+    pipe_id: u32
+}
+
+
 fn main() {
+    let mut compute =
+        ComputeShaderPlugin::new(SHADER_PATH).init_pass("init", Workgroups::over::<States1>());
+
+    for _ in 0..SUBSTEPS {
+        compute = compute
+            .pass("decode_pipe", Workgroups::over::<States1>())
+            .pass("redox_pass_1", Workgroups::exact(uvec3(NUM_REDOX_WG, 1, 1)))
+            .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
+            .pass("update", Workgroups::over::<States1>())
+            .pass("apply_boundaries", Workgroups::exact(uvec3(1, 1, 1)));
+    }
+
     App::new()
         //make it headless
         .add_plugins((
@@ -60,20 +86,24 @@ fn main() {
             ScheduleRunnerPlugin::run_loop(Duration::ZERO),
         ))
         //set up compute shaders
-        .add_plugins(ComputeShaderPlugin::new(SHADER_PATH)
-            .init_pass("init", Workgroups::over::<States1>())
-            .pass("decode_pipe", Workgroups::over::<States1>())
-            .pass("redox_pass_1", Workgroups::exact(uvec3(NUM_REDOX_WG,1,1)))
-            .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
-            .pass("update", Workgroups::over::<States1>())
-            .pass("apply_boundaries", Workgroups::exact(uvec3(1, 1, 1)))
+        .add_plugins(
+            compute
+            /* 
+            ComputeShaderPlugin::new(SHADER_PATH)
+                .init_pass("init", Workgroups::over::<States1>())
+                .pass("decode_pipe", Workgroups::over::<States1>())
+                .pass("redox_pass_1", Workgroups::exact(uvec3(NUM_REDOX_WG, 1, 1)))
+                .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
+                .pass("update", Workgroups::over::<States1>())
+                .pass("apply_boundaries", Workgroups::exact(uvec3(1, 1, 1))),
+        */
         )
         //buffers
         //group 0
-        .register_gpu_buffer::<States1, Vec4>(0, 0, BUFFER_SIZE)
-        .read_back_gpu_buffer::<States1, Vec4>(ReadbackMode::OnRequest)
-        .register_gpu_buffer::<States2, Vec4>(0, 1, BUFFER_SIZE)
-        .read_back_gpu_buffer::<States2, Vec4>(ReadbackMode::OnRequest)
+        .register_gpu_buffer::<States1, CellData>(0, 0, BUFFER_SIZE)
+        .read_back_gpu_buffer::<States1, CellData>(ReadbackMode::OnRequest)
+        .register_gpu_buffer::<States2, CellData>(0, 1, BUFFER_SIZE)
+        .read_back_gpu_buffer::<States2, CellData>(ReadbackMode::OnRequest)
         .register_gpu_buffer::<DecodedBuffer, Decoded>(0, 2, BUFFER_SIZE)
         .register_gpu_buffer::<Partials, f32>(0, 3, NUM_REDOX_WG)
         //group 1
@@ -81,21 +111,18 @@ fn main() {
         .insert_resource(Params {
             cell_count: CELL_COUNT,
             courant: COURANT,
-            dx: 1.0/ CELL_COUNT as f32,
-            t_max: T_MAX
+            dx: 1.0 / CELL_COUNT as f32,
+            t_max: T_MAX,
         })
         .register_gpu_buffer::<TimeBuffer, f32>(1, 1, 3)
         .read_back_gpu_buffer::<TimeBuffer, f32>(ReadbackMode::EveryFrame)
         //.read_back_gpu_buffer::<Partials, f32>(ReadbackMode::EveryFrame)
-
         //systems
-        .add_systems(
-            Update,
-                stop_simulation
-        )
+        .add_systems(Update, stop_simulation)
         .insert_resource(TimeData {
             done: false,
-            state_num: 0
+            state_num: 0,
+            timer: Instant::now(),
         })
         .run();
 }
@@ -103,25 +130,32 @@ fn main() {
 //stops the simulation once the time limit or convergence has been reached
 fn stop_simulation(
     total_time: Res<GpuReadback<TimeBuffer, f32>>,
-    states1: Res<GpuReadback<States1, Vec4>>,
-    states2: Res<GpuReadback<States2, Vec4>>,   
-    mut time_data: ResMut<TimeData>
+    states1: Res<GpuReadback<States1, CellData>>,
+    states2: Res<GpuReadback<States2, CellData>>,
+    mut time_data: ResMut<TimeData>,
 ) {
     if time_data.done {
         if states1.is_changed() || states2.is_changed() {
             if let Some(_data) = match time_data.state_num {
                 1 => states1.latest(),
                 2 => states2.latest(),
-                _ => None
+                _ => None,
             } {
                 println!("Data retrieved!");
-                std::process::exit(0);      
+
+                std::process::exit(0);
             } else {
                 println!("Waiting for results.");
             }
         }
     } else if let Some(time) = total_time.latest() {
         if time[0] >= T_MAX {
+            let elapsed = time_data.timer.elapsed();
+            let frames = time[1];
+            println!("Elapsed time: {:.2?}", elapsed);
+            println!("Average frame time: {:.6?}", elapsed / frames as u32);
+            println!("Average fps: {:.2?}", frames as f32 / elapsed.as_secs_f32());
+
             if time[2] != 0.0 {
                 eprintln!("Error code: {}", time[2]);
             } else {

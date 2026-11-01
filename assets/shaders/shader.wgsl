@@ -23,14 +23,23 @@ struct Decoded {
     euler: vec3f, //physical euler flux
 }
 
+struct CellData {
+    q1: f32,
+    q2: f32,
+    q3: f32,
+    radius: f32,
+    pipe_id: u32
+}
+
 //if step count % 2 == 0, read from states1 and write to states2; otherwise do the opposite
 //first 3 are state values, last f32 is pipe radius
-@group(0) @binding(0) var<storage, read_write> states1: array<vec4f>;
-@group(0) @binding(1) var<storage, read_write> states2: array<vec4f>;
+@group(0) @binding(0) var<storage, read_write> states1: array<CellData>;
+@group(0) @binding(1) var<storage, read_write> states2: array<CellData>;
 @group(0) @binding(2) var<storage, read_write> decoded: array<Decoded>;
 @group(0) @binding(3) var<storage, read_write> partials: array<f32>;
 @group(1) @binding(0) var<uniform> params: Params;
 @group(1) @binding(1) var<storage, read_write> time_buffer: array<f32>;
+//TODO: Replace the vec4 with a struct, paving the way for future additions like species fractions
 
 //Compiler wont allow using REDOX_WG_SIZE here, make sure this matches ALWAYS
 var<workgroup> scratch: array<f32, 256>;
@@ -45,11 +54,13 @@ fn init(@builtin(global_invocation_id) id: vec3u) {
     //default to Sod's problem:
     //Left state: rho = 1, u = 0, p = 1
     //Right state: rho = 0.125, u = 0, p = 0.1
-    let s = select(
-        vec4f(0.125, 0.0, 0.1 / (GAMMA - 1.0), 0.0),  // (ρ, ρu, E) right
-        vec4f(1.0,   0.0, 1.0 / (GAMMA - 1.0), 0.0),  // (ρ, ρu, E) left
-        index <= (params.cell_count >> 1),
-    );
+    //for now, default radius to 1 and pipe id to 0
+    var s: CellData;
+    if index <= (params.cell_count >> 1) {
+        s = CellData(1.0, 0.0, 1.0 / (GAMMA - 1.0), 1.0, 0); // left
+    } else {
+        s = CellData(0.125, 0.0, 0.1 / (GAMMA - 1.0), 1.0, 0); // right
+    }
 
     states1[index] = s;
     states2[index] = s;
@@ -84,18 +95,24 @@ fn update(
     }
     workgroupBarrier();
     if i > params.cell_count || partials[0] == 0.0 { return; }
-    
-    let old_state = select(states2[i],states1[i],time_buffer[1] % 2 == 1).xyz;
+
+    var old_state: vec3f;
+    if time_buffer[1] % 2 == 1 {
+        old_state = vec3f(states1[i].q1, states1[i].q2, states1[i].q3);
+    } else {
+        old_state = vec3f(states2[i].q1, states2[i].q2, states2[i].q3);
+    }
+
     let new_state = old_state - (dt / params.dx) * (fluxes[lid.x + 1u] - fluxes[lid.x]);
     //write to the correct buffer (this will never branch)
     if time_buffer[1] % 2 == 1 {
-        states2[i].x = new_state.x;
-        states2[i].y = new_state.y;
-        states2[i].z = new_state.z;
+        states2[i].q1 = new_state.x;
+        states2[i].q2 = new_state.y;
+        states2[i].q3 = new_state.z;
     } else {
-        states1[i].x = new_state.x;
-        states1[i].y = new_state.y;
-        states1[i].z = new_state.z;
+        states1[i].q1 = new_state.x;
+        states1[i].q2 = new_state.y;
+        states1[i].q3 = new_state.z;
     }
 }
 
@@ -302,7 +319,14 @@ fn decode_pipe(
     let index = gid.x;
     if index >= params.cell_count + 2 || time_buffer[0] >= params.t_max { return; }
 
-    let d = decode_all(select(states2[index],states1[index],time_buffer[1] % 2 == 0).xyz, GAMMA);
+    var q: vec3f;
+    if time_buffer[1] % 2 == 0 {
+        q = vec3f(states1[index].q1, states1[index].q2, states1[index].q3);
+    } else {
+        q = vec3f(states2[index].q1, states2[index].q2, states2[index].q3);
+    }
+
+    let d = decode_all(q, GAMMA);
 
 
     if !(d.rho > 0.0) {
