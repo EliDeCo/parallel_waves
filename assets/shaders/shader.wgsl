@@ -7,11 +7,24 @@ const TOTAL_THREADS: u32 = REDOX_WG_SIZE * NUM_REDOX_WG;
 const F32_MAX: f32 = 3.4028235e+38; 
 
 struct Params {
-    cell_count: u32,
     courant: f32,
-    dx: f32,
-    t_max: f32
+    t_max: f32,
+    total_cells: u32,
+    pipes: array<Pipe>
 }
+
+struct Pipe {
+    cell_count: u32,
+    length: f32,
+    dx: f32,
+    ///density, velocity, pressure
+    left_init_state: vec3f,
+    radius: f32,
+    ///density, velocity, pressure
+    right_init_state: vec3f,
+    start_index: u32,
+}
+
 
 struct Decoded {
     q: vec3f,     //conserved variables (rho, rho*u, E)
@@ -37,7 +50,7 @@ struct CellData {
 @group(0) @binding(1) var<storage, read_write> states2: array<CellData>;
 @group(0) @binding(2) var<storage, read_write> decoded: array<Decoded>;
 @group(0) @binding(3) var<storage, read_write> partials: array<f32>;
-@group(1) @binding(0) var<uniform> params: Params;
+@group(1) @binding(0) var<storage> params: Params;
 @group(1) @binding(1) var<storage, read_write> time_buffer: array<f32>;
 //TODO: Replace the vec4 with a struct, paving the way for future additions like species fractions
 
@@ -49,21 +62,19 @@ var<workgroup> fluxes: array<vec3f, 65>;
 @compute @workgroup_size(WG_SIZE)
 fn init(@builtin(global_invocation_id) id: vec3u) {
     let index = id.x;
-    if index >= params.cell_count + 2 {return;} //include ghosts in init
+    if index >= params.total_cells {return;}
 
-    //default to Sod's problem:
-    //Left state: rho = 1, u = 0, p = 1
-    //Right state: rho = 0.125, u = 0, p = 0.1
-    //for now, default radius to 1 and pipe id to 0
-    var s: CellData;
-    if index <= (params.cell_count >> 1) {
-        s = CellData(1.0, 0.0, 1.0 / (GAMMA - 1.0), 1.0, 0); // left
-    } else {
-        s = CellData(0.125, 0.0, 0.1 / (GAMMA - 1.0), 1.0, 0); // right
+    for (var i: u32 = 0; i < arrayLength(&params.pipes); i++) {
+        let pipe = params.pipes[i];
+        if index >= pipe.start_index && index <= (pipe.start_index + pipe.cell_count + 1) {
+            //this cell belongs to this pipe
+            let half = pipe.cell_count >> 1;
+            let state: vec3f = select(pipe.right_init_state, pipe.left_init_state, index <= (pipe.start_index + half));
+            states1[index] = CellData(state.x, state.y * state.x, state.z / (GAMMA - 1.0) + 0.5 * state.x * state.y * state.y, pipe.radius, i);
+            states2[index] = states1[index];
+            break;
+        }
     }
-
-    states1[index] = s;
-    states2[index] = s;
 
     //ensure total time elapsed and total cycles are properly initialized
     if index == 0 {
@@ -79,50 +90,59 @@ fn update(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,  
 ) {
-    let i = gid.x + 1; // interior cell index (1 ghost cell at each end)
-    
-    
-    let dt = partials[0];
+    let global_index = gid.x;
+    let in_bounds = global_index < params.total_cells;
+    let pipe = params.pipes[states1[global_index].pipe_id]; // only meaningful if in_bounds
+    let pipe_index = global_index - pipe.start_index;
+    let is_interior = in_bounds && pipe_index >= 1 && pipe_index <= pipe.cell_count;
+    let is_right_ghost = in_bounds && pipe_index == pipe.cell_count + 1;
 
-    //flux stuff happens here
-    
-    let n = params.cell_count;
-
-    // Each thread computes the face on its left; the last thread also does the right edge.
-    fluxes[lid.x] = hllc(min(i-1,n), GAMMA); // F_{i-1/2}
-    if lid.x == WG_SIZE - 1 {
-        fluxes[WG_SIZE] = hllc(min(i,n), GAMMA); // F_{i+1/2}
+    // The right ghost computes the last interior cell's right face
+    if is_interior || is_right_ghost {
+        fluxes[lid.x] = hllc(global_index - 1, GAMMA); // F_{i-1/2}
+    }
+    if is_interior && lid.x == WG_SIZE - 1 {
+        fluxes[WG_SIZE] = hllc(global_index, GAMMA);   // F_{i+1/2}
     }
     workgroupBarrier();
-    if i > params.cell_count || partials[0] == 0.0 { return; }
 
-    var old_state: vec3f;
-    if time_buffer[1] % 2 == 1 {
-        old_state = vec3f(states1[i].q1, states1[i].q2, states1[i].q3);
-    } else {
-        old_state = vec3f(states2[i].q1, states2[i].q2, states2[i].q3);
-    }
+    let dt = partials[0];
+    if !is_interior || dt == 0.0 { return; }
 
-    let new_state = old_state - (dt / params.dx) * (fluxes[lid.x + 1u] - fluxes[lid.x]);
+    let old_state = select(
+        vec3f(states2[global_index].q1, states2[global_index].q2, states2[global_index].q3),
+        vec3f(states1[global_index].q1, states1[global_index].q2, states1[global_index].q3),
+        time_buffer[1] % 2 == 1,
+    );
+
+    let new_state = old_state - (dt / pipe.dx) * (fluxes[lid.x + 1] - fluxes[lid.x]);
     //write to the correct buffer (this will never branch)
     if time_buffer[1] % 2 == 1 {
-        states2[i].q1 = new_state.x;
-        states2[i].q2 = new_state.y;
-        states2[i].q3 = new_state.z;
+        states2[global_index].q1 = new_state.x;
+        states2[global_index].q2 = new_state.y;
+        states2[global_index].q3 = new_state.z;
     } else {
-        states1[i].q1 = new_state.x;
-        states1[i].q2 = new_state.y;
-        states1[i].q3 = new_state.z;
+        states1[global_index].q1 = new_state.x;
+        states1[global_index].q2 = new_state.y;
+        states1[global_index].q3 = new_state.z;
     }
 }
 
+
 @compute @workgroup_size(2)
 fn apply_boundaries(
-    @builtin(global_invocation_id) gid: vec3<u32>, 
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>,
 ) {
-    let n = params.cell_count;
-    let ghost = select(n + 1, 0u, gid.x == 0);
-    let edge = select(n, 1u, gid.x == 0);
+    let pipe = params.pipes[wg_id.x]; //1 workgroup per pipe
+
+    // lid == 0 means left boundary, lid == 1 means right boundary
+    let left_ghost = pipe.start_index;
+    let right_ghost = left_ghost + pipe.cell_count + 1;
+    
+    let ghost = select(right_ghost, left_ghost, lid.x == 0);
+    let edge = select(right_ghost - 1, left_ghost + 1, lid.x == 0);
+
 
     if time_buffer[1] % 2 == 1 {
         states2[ghost] = states2[edge];
@@ -216,7 +236,8 @@ fn decode_all(q: vec3f, gamma: f32) -> Decoded {
 
 //gets the local timestep for this cell
 fn get_timestep(index: u32) -> f32 {
-    return params.courant * params.dx / (abs(decoded[index].u) + decoded[index].a);
+    let pipe = params.pipes[states1[index].pipe_id];
+    return params.courant * pipe.dx / (abs(decoded[index].u) + decoded[index].a);
 }
 
 //reduce all cells to just 256 partials
@@ -227,11 +248,12 @@ fn redox_pass_1(
     @builtin(workgroup_id)         wid: vec3<u32>,
 ) {
     if time_buffer[0] >= params.t_max { return; }
-    let n = params.cell_count;
+    let n = params.total_cells;
 
     //grid stride loop
     var local_min = F32_MAX;
-    for (var i = gid.x + 1; i <= n; i += TOTAL_THREADS) {
+    //TODO: Make it so this skips all ghost cells (if its even worth the extra complexity)
+    for (var i = gid.x; i < n; i += TOTAL_THREADS) {
         let v = get_timestep(i);
         local_min = min(v, local_min);
     }
@@ -274,9 +296,6 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
         stride >>= 1;
     }
 
-    
-
-
     //thread 0 gives final answers
     if lid.x == 0 {
         var dt = scratch[0];
@@ -317,7 +336,7 @@ fn decode_pipe(
     @builtin(global_invocation_id) gid: vec3<u32>,
 ) {
     let index = gid.x;
-    if index >= params.cell_count + 2 || time_buffer[0] >= params.t_max { return; }
+    if index >= params.total_cells || time_buffer[0] >= params.t_max { return; }
 
     var q: vec3f;
     if time_buffer[1] % 2 == 0 {

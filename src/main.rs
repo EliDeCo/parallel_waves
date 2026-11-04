@@ -6,13 +6,12 @@ use bevy_shader_plugin::prelude::*;
 use std::time::{Duration, Instant};
 
 const SHADER_PATH: &str = "shaders/shader.wgsl";
-const CELL_COUNT: u32 = 2048;
-const BUFFER_SIZE: u32 = CELL_COUNT + 2; //1 ghost cell on each edge
-const COURANT: f32 = 0.5;
+const COURANT: f32 = 0.9;
 //const REDOX_WG_SIZE: u32 = 256;
 const NUM_REDOX_WG: u32 = 256;
 const T_MAX: f32 = 0.2;
 const SUBSTEPS: u32 = 1;
+const GAMMA: f32 = 1.4;
 
 //name tags
 struct States1;
@@ -23,10 +22,11 @@ struct TimeBuffer;
 
 #[derive(Resource, ShaderType, Clone, Default)]
 struct Params {
-    cell_count: u32,
     courant: f32,
-    dx: f32,
     t_max: f32,
+    total_cells: u32,
+    #[shader(size(runtime))]
+    pipes: Box<[Pipe]>,
 }
 
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -47,18 +47,116 @@ struct TimeData {
     timer: Instant,
 }
 
-
 #[derive(ShaderType, Clone, Copy, Default)]
 struct CellData {
     q1: f32,
     q2: f32,
     q3: f32,
     radius: f32,
-    pipe_id: u32
+    pipe_id: u32,
 }
 
+#[derive(ShaderType, Clone, Default)]
+struct Pipe {
+    ///Real cell count
+    cell_count: u32,
+    ///meters
+    length: f32,
+    dx: f32,
+    ///density, velocity, pressure
+    left_init_state: Vec3,
+    ///meters
+    radius: f32,
+    ///density, velocity, pressure
+    right_init_state: Vec3,
+    start_index: u32,
+}
+
+impl Pipe {
+    ///Creates a new Pipe instance; length and radius are in meters
+    fn new(
+        radius: f32,
+        cell_count: u32,
+        length: f32,
+        start_index: u32,
+        left_init_state: Vec3,
+        right_init_state: Vec3,
+    ) -> Self {
+        Self {
+            cell_count,
+            length,
+            dx: length / cell_count as f32,
+            radius,
+            left_init_state,
+            right_init_state,
+            start_index,
+        }
+    }
+}
+
+struct PipeStore {
+    pipes: Vec<Pipe>,
+    total_cells: u32,
+}
+
+impl PipeStore {
+    fn add_pipe(
+        &mut self,
+        radius: f32,
+        cell_count: u32,
+        length: f32,
+        left_init_state: Vec3,
+        right_init_state: Vec3,
+    ) {
+        let start_index = self.total_cells;
+        self.pipes.push(Pipe::new(
+            radius,
+            cell_count,
+            length,
+            start_index,
+            left_init_state,
+            right_init_state,
+        ));
+        self.total_cells += cell_count + 2; //also include two ghost cells for each pipe
+    }
+}
+
+impl Default for PipeStore {
+    fn default() -> Self {
+        Self {
+            pipes: Vec::new(),
+            total_cells: 0,
+        }
+    }
+}
 
 fn main() {
+    let mut pipe_store = PipeStore::default();
+    //add sod's problem pipe in different resolutions
+    pipe_store.add_pipe(
+        1.0 / 100.0,
+        5000,
+        1.0,
+        Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(0.125, 0.0, 0.1),
+    );
+
+    pipe_store.add_pipe(
+        1.0 / 100.0,
+        2500,
+        1.0,
+        Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(0.125, 0.0, 0.1),
+    );
+
+    pipe_store.add_pipe(
+        1.0 / 100.0,
+        1000,
+        1.0,
+        Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(0.125, 0.0, 0.1),
+    );
+
     let mut compute =
         ComputeShaderPlugin::new(SHADER_PATH).init_pass("init", Workgroups::over::<States1>());
 
@@ -68,7 +166,8 @@ fn main() {
             .pass("redox_pass_1", Workgroups::exact(uvec3(NUM_REDOX_WG, 1, 1)))
             .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
             .pass("update", Workgroups::over::<States1>())
-            .pass("apply_boundaries", Workgroups::exact(uvec3(1, 1, 1)));
+            //TODO: If apply_boundaries is wasting threads, refactor to use full size 64 workgroups
+            .pass("apply_boundaries", Workgroups::exact(uvec3(pipe_store.pipes.len() as u32, 1, 1))); //1 workgroup per pipe
     }
 
     App::new()
@@ -87,32 +186,31 @@ fn main() {
         ))
         //set up compute shaders
         .add_plugins(
-            compute
-            /* 
-            ComputeShaderPlugin::new(SHADER_PATH)
-                .init_pass("init", Workgroups::over::<States1>())
-                .pass("decode_pipe", Workgroups::over::<States1>())
-                .pass("redox_pass_1", Workgroups::exact(uvec3(NUM_REDOX_WG, 1, 1)))
-                .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
-                .pass("update", Workgroups::over::<States1>())
-                .pass("apply_boundaries", Workgroups::exact(uvec3(1, 1, 1))),
-        */
+            compute, /*
+                        ComputeShaderPlugin::new(SHADER_PATH)
+                            .init_pass("init", Workgroups::over::<States1>())
+                            .pass("decode_pipe", Workgroups::over::<States1>())
+                            .pass("redox_pass_1", Workgroups::exact(uvec3(NUM_REDOX_WG, 1, 1)))
+                            .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
+                            .pass("update", Workgroups::over::<States1>())
+                            .pass("apply_boundaries", Workgroups::exact(uvec3(1, 1, 1))),
+                    */
         )
         //buffers
         //group 0
-        .register_gpu_buffer::<States1, CellData>(0, 0, BUFFER_SIZE)
+        .register_gpu_buffer::<States1, CellData>(0, 0, pipe_store.total_cells)
         .read_back_gpu_buffer::<States1, CellData>(ReadbackMode::OnRequest)
-        .register_gpu_buffer::<States2, CellData>(0, 1, BUFFER_SIZE)
+        .register_gpu_buffer::<States2, CellData>(0, 1, pipe_store.total_cells)
         .read_back_gpu_buffer::<States2, CellData>(ReadbackMode::OnRequest)
-        .register_gpu_buffer::<DecodedBuffer, Decoded>(0, 2, BUFFER_SIZE)
+        .register_gpu_buffer::<DecodedBuffer, Decoded>(0, 2, pipe_store.total_cells)
         .register_gpu_buffer::<Partials, f32>(0, 3, NUM_REDOX_WG)
         //group 1
-        .register_uniform_buffer::<Params>(1, 0)
+        .register_storage_buffer::<Params>(1, 0, false)
         .insert_resource(Params {
-            cell_count: CELL_COUNT,
             courant: COURANT,
-            dx: 1.0 / CELL_COUNT as f32,
             t_max: T_MAX,
+            total_cells: pipe_store.total_cells,
+            pipes: pipe_store.pipes.into_boxed_slice(),
         })
         .register_gpu_buffer::<TimeBuffer, f32>(1, 1, 3)
         .read_back_gpu_buffer::<TimeBuffer, f32>(ReadbackMode::EveryFrame)
@@ -133,15 +231,33 @@ fn stop_simulation(
     states1: Res<GpuReadback<States1, CellData>>,
     states2: Res<GpuReadback<States2, CellData>>,
     mut time_data: ResMut<TimeData>,
+    params: Res<Params>
 ) {
     if time_data.done {
         if states1.is_changed() || states2.is_changed() {
-            if let Some(_data) = match time_data.state_num {
+            if let Some(data) = match time_data.state_num {
                 1 => states1.latest(),
                 2 => states2.latest(),
                 _ => None,
             } {
                 println!("Data retrieved!");
+
+                //pack data into pipes;
+                let mut pipe_data: Vec<Vec<Vec3>> = Vec::new();
+                for pipe in params.pipes.iter() { //don't include ghost cells
+                    let start = pipe.start_index as usize + 1;
+                    let end = pipe.start_index as usize + pipe.cell_count as usize;
+                    pipe_data.push(data[start..=end]
+                        .iter()
+                        .map(|cell| {
+                                let rho = cell.q1;
+                                let u = cell.q2 / rho;
+                                let p = (GAMMA - 1.0) * (cell.q3 - 0.5 * rho * u * u);
+                                Vec3::new(rho, u, p)
+                        })
+                        .collect()
+                    );
+                }
 
                 std::process::exit(0);
             } else {
