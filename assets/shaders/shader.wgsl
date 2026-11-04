@@ -4,7 +4,13 @@ const WG_SIZE: u32 = 64;
 const REDOX_WG_SIZE: u32 = 256; 
 const NUM_REDOX_WG: u32 = 256;
 const TOTAL_THREADS: u32 = REDOX_WG_SIZE * NUM_REDOX_WG;
-const F32_MAX: f32 = 3.4028235e+38; 
+const F32_MAX: f32 = 3.4028235e+38;
+//Convergence mode stops when no cell's density, velocity or pressure has changed by more than
+//these amounts (kg/m^3, m/s, Pa) over one window of CONVERGENCE_WINDOW seconds
+const CONVERGENCE_TOL: vec3f = vec3f(1e-4, 0.1, 10.0);
+const CONVERGENCE_WINDOW: f32 = 0.01;
+//The f32 cycle counter stops incrementing at 2^24, so stop before reaching it
+const MAX_CYCLES: f32 = 16000000.0;
 
 struct Params {
     courant: f32,
@@ -31,9 +37,10 @@ struct Decoded {
     rho: f32,    //density
     u: f32,      //velocity
     p: f32,      //pressure
+    checkpoint: vec3f, //(rho, u, p) at the start of this convergence window
     h: f32,      //specific total enthalpy
-    a: f32,      //speed of sound
     euler: vec3f, //physical euler flux
+    a: f32,      //speed of sound
 }
 
 struct CellData {
@@ -50,12 +57,13 @@ struct CellData {
 @group(0) @binding(1) var<storage, read_write> states2: array<CellData>;
 @group(0) @binding(2) var<storage, read_write> decoded: array<Decoded>;
 @group(0) @binding(3) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(4) var<storage, read_write> diff_partials: array<vec3f>;
 @group(1) @binding(0) var<storage> params: Params;
 @group(1) @binding(1) var<storage, read_write> time_buffer: array<f32>;
-//TODO: Replace the vec4 with a struct, paving the way for future additions like species fractions
 
-//Compiler wont allow using REDOX_WG_SIZE here, make sure this matches ALWAYS
+//Compiler wont allow using 2*REDOX_WG_SIZE here, make sure this matches ALWAYS
 var<workgroup> scratch: array<f32, 256>;
+var<workgroup> diff_scratch: array<vec3f, 256>;
 //compiler won't allow using WG_SIZE + 1 here
 var<workgroup> fluxes: array<vec3f, 65>;
 
@@ -81,6 +89,10 @@ fn init(@builtin(global_invocation_id) id: vec3u) {
         time_buffer[0] = 0;
         time_buffer[1] = 0;
         time_buffer[2] = 0;
+        time_buffer[3] = 0;
+        time_buffer[4] = CONVERGENCE_WINDOW; //end of the first convergence window
+        time_buffer[5] = 1; //save the first checkpoint
+        partials[0] = 1; //initialize dt to a nonzero number
     }
 
 }
@@ -92,7 +104,7 @@ fn update(
 ) {
     let global_index = gid.x;
     let in_bounds = global_index < params.total_cells;
-    let pipe = params.pipes[states1[global_index].pipe_id]; // only meaningful if in_bounds
+    let pipe = params.pipes[states1[global_index].pipe_id];
     let pipe_index = global_index - pipe.start_index;
     let is_interior = in_bounds && pipe_index >= 1 && pipe_index <= pipe.cell_count;
     let is_right_ghost = in_bounds && pipe_index == pipe.cell_count + 1;
@@ -116,6 +128,10 @@ fn update(
     );
 
     let new_state = old_state - (dt / pipe.dx) * (fluxes[lid.x + 1] - fluxes[lid.x]);
+    
+
+
+
     //write to the correct buffer (this will never branch)
     if time_buffer[1] % 2 == 1 {
         states2[global_index].q1 = new_state.x;
@@ -228,9 +244,10 @@ fn decode_all(q: vec3f, gamma: f32) -> Decoded {
         rho,
         u,
         p,
+        vec3f(0),
         h,
-        sqrt(gamma * p / rho),
-        euler_flux(rho, u, p , h)
+        euler_flux(rho, u, p , h),
+        sqrt(gamma * p / rho)
     );
 }
 
@@ -247,24 +264,28 @@ fn redox_pass_1(
     @builtin(local_invocation_id)  lid: vec3<u32>,
     @builtin(workgroup_id)         wid: vec3<u32>,
 ) {
-    if time_buffer[0] >= params.t_max { return; }
+    if partials[0] == 0 { return; }
     let n = params.total_cells;
 
     //grid stride loop
     var local_min = F32_MAX;
-    //TODO: Make it so this skips all ghost cells (if its even worth the extra complexity)
+    var local_diff = vec3f(0);
     for (var i = gid.x; i < n; i += TOTAL_THREADS) {
         let v = get_timestep(i);
         local_min = min(v, local_min);
+        let primitives = vec3f(decoded[i].rho, decoded[i].u, decoded[i].p);
+        local_diff = max(local_diff, abs(primitives - decoded[i].checkpoint));
     }
 
     scratch[lid.x] = local_min;
+    diff_scratch[lid.x] = local_diff;
     workgroupBarrier();
 
     var stride = REDOX_WG_SIZE >> 1;
     while stride > 0 {
         if lid.x < stride {
             scratch[lid.x] = min(scratch[lid.x], scratch[lid.x + stride]);
+            diff_scratch[lid.x] = max(diff_scratch[lid.x], diff_scratch[lid.x + stride]);
         }
 
         workgroupBarrier();
@@ -273,23 +294,25 @@ fn redox_pass_1(
 
     if lid.x == 0 {
         partials[wid.x] = scratch[0];
+        diff_partials[wid.x] = diff_scratch[0];
     }
 }
 
 //reduces all 256 partials with a single workgroup to get the final minimum
 @compute @workgroup_size(REDOX_WG_SIZE)
 fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
-    if time_buffer[0] >= params.t_max { 
-        if lid.x == 0 { partials[0] = 0; } //set dt to 0 when finished
-        return; 
-    }
+    //if simulation is already over, end early
+    if partials[0] == 0 { return; }
+
     scratch[lid.x] = partials[lid.x];
+    diff_scratch[lid.x] = diff_partials[lid.x];
     workgroupBarrier();
 
     var stride = REDOX_WG_SIZE >> 1;
     while stride > 0 {
         if lid.x < stride {
             scratch[lid.x] = min(scratch[lid.x], scratch[lid.x + stride]);
+            diff_scratch[lid.x] = max(diff_scratch[lid.x], diff_scratch[lid.x + stride]);
         }
 
         workgroupBarrier();
@@ -309,11 +332,33 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
             return;
         } 
 
-        if (t + dt) > params.t_max {
+        //check if simulation is finished, and set dt to 0 if it is
+        time_buffer[5] = 0.0; //the checkpoint only saves on the decode right after a window ends
+        var finished = false;
+        if params.t_max >= 0.0 { //time mode
+            finished = t >= params.t_max;
+        } else if t >= time_buffer[4] { //convergence mode, at the end of a window
+            finished = all(diff_scratch[0] < CONVERGENCE_TOL);
+            time_buffer[4] = t + CONVERGENCE_WINDOW;
+            time_buffer[5] = 1.0;
+        }
+        if finished {
+            partials[0] = 0.0;
+            time_buffer[3] = 1.0;
+            return;
+        }
+
+        if time_buffer[1] >= MAX_CYCLES {
+            raise_error(5);
+            return;
+        }
+
+        //only if in timed mode
+        if params.t_max >= 0.0 && (t + dt) > params.t_max {
             dt = params.t_max - t;
         }
-        t += dt;
 
+        t += dt;
 
         time_buffer[0] = t; //update total elapsed time
         time_buffer[1] += 1; //update cycle counter
@@ -324,10 +369,11 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
 //2 -> dt = NaN
 //3 -> nonphysical density
 //4 -> nonphysical pressure
+//5 -> cycle limit reached
 fn raise_error(error_id: f32) {
-    time_buffer[0] = params.t_max;  //stop all passes
     time_buffer[2] = error_id;           //error flag for the CPU
-    partials[0] = 0.0;    
+    time_buffer[3] = 1.0;                //tell the CPU the simulation is over
+    partials[0] = 0.0;                   //stop all passes
 }
 
 //Decodes the entire pipe and stores it in memory
@@ -336,7 +382,9 @@ fn decode_pipe(
     @builtin(global_invocation_id) gid: vec3<u32>,
 ) {
     let index = gid.x;
-    if index >= params.total_cells || time_buffer[0] >= params.t_max { return; }
+    if index >= params.total_cells //out of bounds
+    || partials[0] == 0 //simulation over
+    { return; }
 
     var q: vec3f;
     if time_buffer[1] % 2 == 0 {
@@ -345,7 +393,13 @@ fn decode_pipe(
         q = vec3f(states2[index].q1, states2[index].q2, states2[index].q3);
     }
 
-    let d = decode_all(q, GAMMA);
+    var d = decode_all(q, GAMMA);
+    //save a new checkpoint at the start of a window, otherwise keep the current one
+    if time_buffer[5] != 0.0 {
+        d.checkpoint = vec3f(d.rho, d.u, d.p);
+    } else {
+        d.checkpoint = decoded[index].checkpoint;
+    }
 
 
     if !(d.rho > 0.0) {

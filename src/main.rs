@@ -9,20 +9,25 @@ const SHADER_PATH: &str = "shaders/shader.wgsl";
 const COURANT: f32 = 0.9;
 //const REDOX_WG_SIZE: u32 = 256;
 const NUM_REDOX_WG: u32 = 256;
-const T_MAX: f32 = 0.2;
-const SUBSTEPS: u32 = 1;
+const T_MAX: f32 = 6.9541e-4; //seconds; matches t = 0.2 in the unitless Sod problem
+const SUBSTEPS: u32 = 10;
 const GAMMA: f32 = 1.4;
 
 //name tags
 struct States1;
 struct States2;
 struct Partials;
+struct DiffPartials;
 struct DecodedBuffer;
+///[0] = elapsed time, [1] = frame count, [2] = error code, [3] = finished flag,
+///[4] = end of this convergence window, [5] = save checkpoint flag
 struct TimeBuffer;
+
 
 #[derive(Resource, ShaderType, Clone, Default)]
 struct Params {
     courant: f32,
+    ///set to -1 for convergence mode
     t_max: f32,
     total_cells: u32,
     #[shader(size(runtime))]
@@ -35,9 +40,11 @@ struct Decoded {
     rho: f32,
     u: f32,
     p: f32,
+    ///(rho, u, p) at the start of this convergence window
+    checkpoint: Vec3,
     h: f32,
-    a: f32,
     euler: Vec3,
+    a: f32,
 }
 
 #[derive(Resource)]
@@ -132,29 +139,29 @@ impl Default for PipeStore {
 
 fn main() {
     let mut pipe_store = PipeStore::default();
-    //add sod's problem pipe in different resolutions
+    //add sod's problem pipe in different resolutions; left is sea-level air, in kg/m^3, m/s and Pa, with Sod's 8:1 density and 10:1 pressure ratios
     pipe_store.add_pipe(
         1.0 / 100.0,
         5000,
         1.0,
-        Vec3::new(1.0, 0.0, 1.0),
-        Vec3::new(0.125, 0.0, 0.1),
+        Vec3::new(1.225, 0.0, 101325.0),
+        Vec3::new(0.153125, 0.0, 10132.5),
     );
 
     pipe_store.add_pipe(
         1.0 / 100.0,
         2500,
         1.0,
-        Vec3::new(1.0, 0.0, 1.0),
-        Vec3::new(0.125, 0.0, 0.1),
+        Vec3::new(1.225, 0.0, 101325.0),
+        Vec3::new(0.153125, 0.0, 10132.5),
     );
 
     pipe_store.add_pipe(
         1.0 / 100.0,
         1000,
         1.0,
-        Vec3::new(1.0, 0.0, 1.0),
-        Vec3::new(0.125, 0.0, 0.1),
+        Vec3::new(1.225, 0.0, 101325.0),
+        Vec3::new(0.153125, 0.0, 10132.5),
     );
 
     let mut compute =
@@ -166,7 +173,7 @@ fn main() {
             .pass("redox_pass_1", Workgroups::exact(uvec3(NUM_REDOX_WG, 1, 1)))
             .pass("redox_pass_2", Workgroups::exact(uvec3(1, 1, 1)))
             .pass("update", Workgroups::over::<States1>())
-            //TODO: If apply_boundaries is wasting threads, refactor to use full size 64 workgroups
+            //TODO: If apply_boundaries is wasting too many threads, refactor to use full size 64 workgroups
             .pass("apply_boundaries", Workgroups::exact(uvec3(pipe_store.pipes.len() as u32, 1, 1))); //1 workgroup per pipe
     }
 
@@ -204,6 +211,7 @@ fn main() {
         .read_back_gpu_buffer::<States2, CellData>(ReadbackMode::OnRequest)
         .register_gpu_buffer::<DecodedBuffer, Decoded>(0, 2, pipe_store.total_cells)
         .register_gpu_buffer::<Partials, f32>(0, 3, NUM_REDOX_WG)
+        .register_gpu_buffer::<DiffPartials, Vec3>(0, 4, NUM_REDOX_WG)
         //group 1
         .register_storage_buffer::<Params>(1, 0, false)
         .insert_resource(Params {
@@ -212,7 +220,7 @@ fn main() {
             total_cells: pipe_store.total_cells,
             pipes: pipe_store.pipes.into_boxed_slice(),
         })
-        .register_gpu_buffer::<TimeBuffer, f32>(1, 1, 3)
+        .register_gpu_buffer::<TimeBuffer, f32>(1, 1, 6)
         .read_back_gpu_buffer::<TimeBuffer, f32>(ReadbackMode::EveryFrame)
         //.read_back_gpu_buffer::<Partials, f32>(ReadbackMode::EveryFrame)
         //systems
@@ -265,11 +273,11 @@ fn stop_simulation(
             }
         }
     } else if let Some(time) = total_time.latest() {
-        if time[0] >= T_MAX {
+        if time[3] != 0.0 {
             let elapsed = time_data.timer.elapsed();
             let frames = time[1];
             println!("Elapsed time: {:.2?}", elapsed);
-            println!("Average frame time: {:.6?}", elapsed / frames as u32);
+            println!("Average frame time: {:.6?}", elapsed / (frames as u32).max(1));
             println!("Average fps: {:.2?}", frames as f32 / elapsed.as_secs_f32());
 
             if time[2] != 0.0 {
