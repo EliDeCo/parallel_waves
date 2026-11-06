@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 use bevy::{
     app::ScheduleRunnerPlugin, prelude::*, /*time::common_conditions::on_timer,*/
     window::ExitCondition, winit::WinitPlugin,
@@ -17,19 +19,20 @@ const GAMMA: f32 = 1.4;
 struct States1;
 struct States2;
 struct Partials;
-struct DiffPartials;
 struct DecodedBuffer;
-///[0] = elapsed time, [1] = frame count, [2] = error code, [3] = finished flag,
-///[4] = end of this convergence window, [5] = save checkpoint flag
+///[0] = elapsed time, [1] = frame count, [2] = error code, [3] = finished flag
 struct TimeBuffer;
 
 
 #[derive(Resource, ShaderType, Clone, Default)]
 struct Params {
     courant: f32,
-    ///set to -1 for convergence mode
     t_max: f32,
     total_cells: u32,
+    ///Pa
+    atmos_p: f32,
+    ///Celcius
+    atmos_T: f32,
     #[shader(size(runtime))]
     pipes: Box<[Pipe]>,
 }
@@ -40,8 +43,6 @@ struct Decoded {
     rho: f32,
     u: f32,
     p: f32,
-    ///(rho, u, p) at the start of this convergence window
-    checkpoint: Vec3,
     h: f32,
     euler: Vec3,
     a: f32,
@@ -63,6 +64,15 @@ struct CellData {
     pipe_id: u32,
 }
 
+enum Boundary {
+    ///1
+    Transmissive,
+    ///2
+    Closed,
+    ///3
+    Exhaust
+}
+
 #[derive(ShaderType, Clone, Default)]
 struct Pipe {
     ///Real cell count
@@ -77,6 +87,7 @@ struct Pipe {
     ///density, velocity, pressure
     right_init_state: Vec3,
     start_index: u32,
+    boundaries: [u32; 2]
 }
 
 impl Pipe {
@@ -88,7 +99,19 @@ impl Pipe {
         start_index: u32,
         left_init_state: Vec3,
         right_init_state: Vec3,
+        left_boundary: Boundary,
+        right_boundary: Boundary
     ) -> Self {
+        let left = match left_boundary {
+            Boundary::Transmissive => 1,
+            Boundary::Closed => 2,
+            Boundary::Exhaust => 3
+        };
+        let right = match right_boundary {
+            Boundary::Transmissive => 1,
+            Boundary::Closed => 2,
+            Boundary::Exhaust => 3
+        };
         Self {
             cell_count,
             length,
@@ -97,6 +120,7 @@ impl Pipe {
             left_init_state,
             right_init_state,
             start_index,
+            boundaries: [left, right]
         }
     }
 }
@@ -114,6 +138,8 @@ impl PipeStore {
         length: f32,
         left_init_state: Vec3,
         right_init_state: Vec3,
+        left_boundary: Boundary,
+        right_boundary: Boundary
     ) {
         let start_index = self.total_cells;
         self.pipes.push(Pipe::new(
@@ -123,6 +149,8 @@ impl PipeStore {
             start_index,
             left_init_state,
             right_init_state,
+            left_boundary,
+            right_boundary
         ));
         self.total_cells += cell_count + 2; //also include two ghost cells for each pipe
     }
@@ -146,6 +174,8 @@ fn main() {
         1.0,
         Vec3::new(1.225, 0.0, 101325.0),
         Vec3::new(0.153125, 0.0, 10132.5),
+        Boundary::Transmissive,
+        Boundary::Transmissive
     );
 
     pipe_store.add_pipe(
@@ -154,6 +184,8 @@ fn main() {
         1.0,
         Vec3::new(1.225, 0.0, 101325.0),
         Vec3::new(0.153125, 0.0, 10132.5),
+        Boundary::Transmissive,
+        Boundary::Transmissive
     );
 
     pipe_store.add_pipe(
@@ -162,6 +194,8 @@ fn main() {
         1.0,
         Vec3::new(1.225, 0.0, 101325.0),
         Vec3::new(0.153125, 0.0, 10132.5),
+        Boundary::Transmissive,
+        Boundary::Transmissive
     );
 
     let mut compute =
@@ -211,7 +245,6 @@ fn main() {
         .read_back_gpu_buffer::<States2, CellData>(ReadbackMode::OnRequest)
         .register_gpu_buffer::<DecodedBuffer, Decoded>(0, 2, pipe_store.total_cells)
         .register_gpu_buffer::<Partials, f32>(0, 3, NUM_REDOX_WG)
-        .register_gpu_buffer::<DiffPartials, Vec3>(0, 4, NUM_REDOX_WG)
         //group 1
         .register_storage_buffer::<Params>(1, 0, false)
         .insert_resource(Params {
@@ -219,8 +252,10 @@ fn main() {
             t_max: T_MAX,
             total_cells: pipe_store.total_cells,
             pipes: pipe_store.pipes.into_boxed_slice(),
+            atmos_p: 101325.0,
+            atmos_T: 20.0
         })
-        .register_gpu_buffer::<TimeBuffer, f32>(1, 1, 6)
+        .register_gpu_buffer::<TimeBuffer, f32>(1, 1, 4)
         .read_back_gpu_buffer::<TimeBuffer, f32>(ReadbackMode::EveryFrame)
         //.read_back_gpu_buffer::<Partials, f32>(ReadbackMode::EveryFrame)
         //systems
@@ -233,7 +268,7 @@ fn main() {
         .run();
 }
 
-//stops the simulation once the time limit or convergence has been reached
+//stops the simulation once the time limit has been reached
 fn stop_simulation(
     total_time: Res<GpuReadback<TimeBuffer, f32>>,
     states1: Res<GpuReadback<States1, CellData>>,

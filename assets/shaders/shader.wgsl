@@ -5,17 +5,21 @@ const REDOX_WG_SIZE: u32 = 256;
 const NUM_REDOX_WG: u32 = 256;
 const TOTAL_THREADS: u32 = REDOX_WG_SIZE * NUM_REDOX_WG;
 const F32_MAX: f32 = 3.4028235e+38;
-//Convergence mode stops when no cell's density, velocity or pressure has changed by more than
-//these amounts (kg/m^3, m/s, Pa) over one window of CONVERGENCE_WINDOW seconds
-const CONVERGENCE_TOL: vec3f = vec3f(1e-4, 0.1, 10.0);
-const CONVERGENCE_WINDOW: f32 = 0.01;
 //The f32 cycle counter stops incrementing at 2^24, so stop before reaching it
 const MAX_CYCLES: f32 = 16000000.0;
+//Exhaust outflow obeys p_exit - p_atmos = EXHAUST_DRAG * rho * u^2 / 2 (Borisenko et al. 1999, eq. 1.4)
+const EXHAUST_DRAG: f32 = 0.5;
+//Newton steps for the exit pressure; 3 reach f32 precision, 1 more is a margin
+const EXHAUST_NEWTON_STEPS: i32 = 4;
 
 struct Params {
     courant: f32,
     t_max: f32,
     total_cells: u32,
+    ///Pa
+    atmos_p: f32,
+    ///Celcius
+    atmos_T: f32,
     pipes: array<Pipe>
 }
 
@@ -29,6 +33,7 @@ struct Pipe {
     ///density, velocity, pressure
     right_init_state: vec3f,
     start_index: u32,
+    boundaries: array<u32, 2>
 }
 
 
@@ -37,7 +42,6 @@ struct Decoded {
     rho: f32,    //density
     u: f32,      //velocity
     p: f32,      //pressure
-    checkpoint: vec3f, //(rho, u, p) at the start of this convergence window
     h: f32,      //specific total enthalpy
     euler: vec3f, //physical euler flux
     a: f32,      //speed of sound
@@ -57,13 +61,11 @@ struct CellData {
 @group(0) @binding(1) var<storage, read_write> states2: array<CellData>;
 @group(0) @binding(2) var<storage, read_write> decoded: array<Decoded>;
 @group(0) @binding(3) var<storage, read_write> partials: array<f32>;
-@group(0) @binding(4) var<storage, read_write> diff_partials: array<vec3f>;
 @group(1) @binding(0) var<storage> params: Params;
 @group(1) @binding(1) var<storage, read_write> time_buffer: array<f32>;
 
 //Compiler wont allow using 2*REDOX_WG_SIZE here, make sure this matches ALWAYS
 var<workgroup> scratch: array<f32, 256>;
-var<workgroup> diff_scratch: array<vec3f, 256>;
 //compiler won't allow using WG_SIZE + 1 here
 var<workgroup> fluxes: array<vec3f, 65>;
 
@@ -90,8 +92,6 @@ fn init(@builtin(global_invocation_id) id: vec3u) {
         time_buffer[1] = 0;
         time_buffer[2] = 0;
         time_buffer[3] = 0;
-        time_buffer[4] = CONVERGENCE_WINDOW; //end of the first convergence window
-        time_buffer[5] = 1; //save the first checkpoint
         partials[0] = 1; //initialize dt to a nonzero number
     }
 
@@ -128,9 +128,6 @@ fn update(
     );
 
     let new_state = old_state - (dt / pipe.dx) * (fluxes[lid.x + 1] - fluxes[lid.x]);
-    
-
-
 
     //write to the correct buffer (this will never branch)
     if time_buffer[1] % 2 == 1 {
@@ -156,15 +153,123 @@ fn apply_boundaries(
     let left_ghost = pipe.start_index;
     let right_ghost = left_ghost + pipe.cell_count + 1;
     
-    let ghost = select(right_ghost, left_ghost, lid.x == 0);
-    let edge = select(right_ghost - 1, left_ghost + 1, lid.x == 0);
+    let ghost_id = select(right_ghost, left_ghost, lid.x == 0);
+    let edge_id = select(right_ghost - 1, left_ghost + 1, lid.x == 0);
 
+    let edge = select(
+        vec3f(states1[edge_id].q1, states1[edge_id].q2, states1[edge_id].q3),
+        vec3f(states2[edge_id].q1, states2[edge_id].q2, states2[edge_id].q3),
+        time_buffer[1] % 2 == 1,
+    );
+
+    //transmissive by default
+    var new_ghost = edge; 
+
+    //change to mirrored closed end if selected (flips velocity against itself equally)
+    new_ghost.y = select(new_ghost.y, -new_ghost.y, pipe.boundaries[lid.x] == 2);
+
+    //if exhaust (abrupt pipe end, outlfow only) is chosen
+    if pipe.boundaries[lid.x] == 3 {
+        new_ghost = exhaust_ghost(edge, select(1.0, -1.0, lid.x == 0), params.atmos_p);
+    }
 
     if time_buffer[1] % 2 == 1 {
-        states2[ghost] = states2[edge];
+        states2[ghost_id].q1 = new_ghost.x;
+        states2[ghost_id].q2 = new_ghost.y;
+        states2[ghost_id].q3 = new_ghost.z;
     } else {
-        states1[ghost] = states1[edge];
+        states1[ghost_id].q1 = new_ghost.x;
+        states1[ghost_id].q2 = new_ghost.y;
+        states1[ghost_id].q3 = new_ghost.z;
     }
+}
+
+///The wave that joins the end cell (rho, p, a) to the boundary pressure, with its slopes
+struct ExhaustWave {
+    f: f32,     //velocity change across the wave, so boundary velocity = u - f
+    df: f32,    //df/dP
+    rho: f32,   //density on the boundary side of the wave
+    drho: f32,  //d(rho)/dP
+}
+
+///Rarefaction or shock curve from the end cell to the given pressure
+///(Dubois 2001, eqs. 1.3.19, 1.4.20, 1.6.12, 1.6.13)
+fn exhaust_wave(pressure: f32, rho: f32, p: f32, a: f32) -> ExhaustWave {
+    if pressure > p { //shock
+        let mu2 = (GAMMA - 1.0) / (GAMMA + 1.0);
+        let s = sqrt((1.0 - mu2) / (rho * (pressure + mu2 * p)));
+        let denom = p + mu2 * pressure;
+        return ExhaustWave(
+            (pressure - p) * s,
+            s * (1.0 - (pressure - p) / (2.0 * (pressure + mu2 * p))),
+            rho * (pressure + mu2 * p) / denom,
+            rho * (1.0 - mu2 * mu2) * p / (denom * denom),
+        );
+    }
+
+    //rarefaction
+    let a_ratio = pow(pressure / p, (GAMMA - 1.0) / (2.0 * GAMMA));
+    let rho_b = rho * pow(pressure / p, 1.0 / GAMMA);
+    return ExhaustWave(
+        2.0 * a / (GAMMA - 1.0) * (a_ratio - 1.0),
+        1.0 / (rho_b * a * a_ratio),
+        rho_b,
+        rho_b / (GAMMA * pressure),
+    );
+}
+
+///Returns the conserved ghost state for a flat pipe end venting to atmosphere.
+///Outflow only: if the flow would reverse, the end acts as a shut one-way valve.
+///`outward` is +1 at the right end of a pipe and -1 at the left end.
+fn exhaust_ghost(edge: vec3f, outward: f32, atmos_p: f32) -> vec3f {
+    let cell = decode_conserved(edge, GAMMA);
+    let rho = cell.x;
+    let u = cell.y * outward; //positive when leaving the pipe
+    let p = cell.z;
+    let a = sqrt(GAMMA * p / rho);
+
+    //valve shut: mirror the cell, same as a closed end
+    if u - exhaust_wave(atmos_p, rho, p, a).f <= 0.0 {
+        return vec3f(edge.x, -edge.y, edge.z);
+    }
+
+    //the pressure at which the wave stands still at the exit: a sonic point inside
+    //a rarefaction for subsonic flow, or a stationary normal shock for supersonic flow
+    let a_sonic = (2.0 * a + (GAMMA - 1.0) * u) / (GAMMA + 1.0);
+    let mach2 = u * u / (a * a);
+    let p_crit = select(
+        p * (1.0 + 2.0 * GAMMA / (GAMMA + 1.0) * (mach2 - 1.0)),
+        p * pow(a_sonic / a, 2.0 * GAMMA / (GAMMA - 1.0)),
+        u < a,
+    );
+
+    //if the drag law can't be met below that pressure, the exit is choked or supersonic
+    let crit_wave = exhaust_wave(p_crit, rho, p, a);
+    let crit_u = u - crit_wave.f;
+    if p_crit - atmos_p - 0.5 * EXHAUST_DRAG * crit_wave.rho * abs(crit_u) * crit_u >= 0.0 {
+        if u >= a {
+            return edge; //nothing travels back into the pipe
+        }
+        let rho_sonic = rho * pow(a_sonic / a, 2.0 / (GAMMA - 1.0));
+        return exhaust_conserved(rho_sonic, a_sonic * outward, p_crit);
+    }
+
+    //subsonic exit: solve the drag law for the exit pressure (Borisenko et al. 1999, eqs. 2.3-2.4)
+    var pressure = max(atmos_p, p_crit);
+    var wave = exhaust_wave(pressure, rho, p, a);
+    for (var i = 0; i < EXHAUST_NEWTON_STEPS; i++) {
+        let u_b = u - wave.f;
+        let g = pressure - atmos_p - 0.5 * EXHAUST_DRAG * wave.rho * abs(u_b) * u_b;
+        let dg = 1.0 - 0.5 * EXHAUST_DRAG * wave.drho * abs(u_b) * u_b
+            + EXHAUST_DRAG * wave.rho * abs(u_b) * wave.df;
+        pressure -= g / dg;
+        wave = exhaust_wave(pressure, rho, p, a);
+    }
+    return exhaust_conserved(wave.rho, (u - wave.f) * outward, pressure);
+}
+
+fn exhaust_conserved(rho: f32, u: f32, p: f32) -> vec3f {
+    return vec3f(rho, rho * u, p / (GAMMA - 1.0) + 0.5 * rho * u * u);
 }
 
 ///Returns the HLLC flux between two decoded states, using the wave speeds of
@@ -244,7 +349,6 @@ fn decode_all(q: vec3f, gamma: f32) -> Decoded {
         rho,
         u,
         p,
-        vec3f(0),
         h,
         euler_flux(rho, u, p , h),
         sqrt(gamma * p / rho)
@@ -269,23 +373,18 @@ fn redox_pass_1(
 
     //grid stride loop
     var local_min = F32_MAX;
-    var local_diff = vec3f(0);
     for (var i = gid.x; i < n; i += TOTAL_THREADS) {
         let v = get_timestep(i);
         local_min = min(v, local_min);
-        let primitives = vec3f(decoded[i].rho, decoded[i].u, decoded[i].p);
-        local_diff = max(local_diff, abs(primitives - decoded[i].checkpoint));
     }
 
     scratch[lid.x] = local_min;
-    diff_scratch[lid.x] = local_diff;
     workgroupBarrier();
 
     var stride = REDOX_WG_SIZE >> 1;
     while stride > 0 {
         if lid.x < stride {
             scratch[lid.x] = min(scratch[lid.x], scratch[lid.x + stride]);
-            diff_scratch[lid.x] = max(diff_scratch[lid.x], diff_scratch[lid.x + stride]);
         }
 
         workgroupBarrier();
@@ -294,7 +393,6 @@ fn redox_pass_1(
 
     if lid.x == 0 {
         partials[wid.x] = scratch[0];
-        diff_partials[wid.x] = diff_scratch[0];
     }
 }
 
@@ -305,14 +403,12 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
     if partials[0] == 0 { return; }
 
     scratch[lid.x] = partials[lid.x];
-    diff_scratch[lid.x] = diff_partials[lid.x];
     workgroupBarrier();
 
     var stride = REDOX_WG_SIZE >> 1;
     while stride > 0 {
         if lid.x < stride {
             scratch[lid.x] = min(scratch[lid.x], scratch[lid.x + stride]);
-            diff_scratch[lid.x] = max(diff_scratch[lid.x], diff_scratch[lid.x + stride]);
         }
 
         workgroupBarrier();
@@ -333,16 +429,7 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
         } 
 
         //check if simulation is finished, and set dt to 0 if it is
-        time_buffer[5] = 0.0; //the checkpoint only saves on the decode right after a window ends
-        var finished = false;
-        if params.t_max >= 0.0 { //time mode
-            finished = t >= params.t_max;
-        } else if t >= time_buffer[4] { //convergence mode, at the end of a window
-            finished = all(diff_scratch[0] < CONVERGENCE_TOL);
-            time_buffer[4] = t + CONVERGENCE_WINDOW;
-            time_buffer[5] = 1.0;
-        }
-        if finished {
+        if t >= params.t_max {
             partials[0] = 0.0;
             time_buffer[3] = 1.0;
             return;
@@ -353,8 +440,8 @@ fn redox_pass_2(@builtin(local_invocation_id) lid: vec3<u32>) {
             return;
         }
 
-        //only if in timed mode
-        if params.t_max >= 0.0 && (t + dt) > params.t_max {
+        //land exactly on the time limit
+        if (t + dt) > params.t_max {
             dt = params.t_max - t;
         }
 
@@ -393,14 +480,7 @@ fn decode_pipe(
         q = vec3f(states2[index].q1, states2[index].q2, states2[index].q3);
     }
 
-    var d = decode_all(q, GAMMA);
-    //save a new checkpoint at the start of a window, otherwise keep the current one
-    if time_buffer[5] != 0.0 {
-        d.checkpoint = vec3f(d.rho, d.u, d.p);
-    } else {
-        d.checkpoint = decoded[index].checkpoint;
-    }
-
+    let d = decode_all(q, GAMMA);
 
     if !(d.rho > 0.0) {
         raise_error(3);
